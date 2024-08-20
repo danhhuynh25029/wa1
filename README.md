@@ -1,2 +1,4 @@
 # wa1
-This project to implement simple webauth with golang 
+This project to implement simple webauth
+* Rust
+* React
