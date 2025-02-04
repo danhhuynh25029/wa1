@@ -3,17 +3,17 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/duo-labs/webauthn.io/session"
 	"github.com/duo-labs/webauthn/webauthn"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	"github.com/gorilla/sessions"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 )
 
 var webAuthn *webauthn.WebAuthn
-var sessionStore *sessions.CookieStore
+var sessionStore *session.Store
 var userDB *userdb
 
 func main() {
@@ -22,6 +22,7 @@ func main() {
 	webAuthn, err = webauthn.New(&webauthn.Config{
 		RPDisplayName: "Foobar Corp.", // display name for your site
 		RPID:          "localhost",    // generally the domain name for your site
+		RPOrigin:      "http://localhost:8080",
 	})
 
 	if err != nil {
@@ -30,17 +31,23 @@ func main() {
 
 	userDB = DB()
 
-	sessionStore = sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET")))
+	sessionStore, err = session.NewStore()
+	if err != nil {
+		log.Fatal("failed to create session store:", err)
+	}
 
 	r := mux.NewRouter()
 
 	r.HandleFunc("/register/begin/{username}", BeginRegistration).Methods("GET")
-
+	r.HandleFunc("/register/finish/{username}", FinishRegistration).Methods("POST")
+	r.HandleFunc("/login/begin/{username}", BeginLogin).Methods("GET")
+	r.HandleFunc("/login/finish/{username}", FinishLogin).Methods("POST")
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./")))
-
+	originsOk := handlers.AllowedOrigins([]string{"*"})
+	methodsOk := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "OPTIONS"})
 	serverAddress := ":8080"
 	log.Println("starting server at", serverAddress)
-	log.Fatal(http.ListenAndServe(serverAddress, r))
+	log.Fatal(http.ListenAndServe(serverAddress, handlers.CORS(originsOk, methodsOk)(r)))
 }
 
 func BeginRegistration(w http.ResponseWriter, r *http.Request) {
@@ -69,17 +76,77 @@ func BeginRegistration(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	session, err := sessionStore.New(r, "session")
+	err = sessionStore.SaveWebauthnSession("registration", sessionData, r, w)
+	if err != nil {
+		log.Println(err)
+		jsonResponse(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	options.Response.AuthenticatorSelection.AuthenticatorAttachment = "cross-platform"
+	jsonResponse(w, options, http.StatusOK)
+}
 
-	sessionDataJSON, err := json.Marshal(sessionData)
+func FinishRegistration(w http.ResponseWriter, r *http.Request) {
+
+	// get username
+	vars := mux.Vars(r)
+	username := vars["username"]
+
+	// get user
+	user, err := userDB.GetUser(username)
+	// user doesn't exist
+	if err != nil {
+		log.Println("GetUser ", err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// load the session data
+	sessionData, err := sessionStore.GetWebauthnSession("registration", r)
+	if err != nil {
+		log.Println("GetWebauthnSession ", err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	credential, err := webAuthn.FinishRegistration(user, sessionData, r)
+	if err != nil {
+		log.Println("FinishRegistration ", err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	user.AddCredential(*credential)
+
+	jsonResponse(w, "Registration Success", http.StatusOK)
+	return
+}
+
+func BeginLogin(w http.ResponseWriter, r *http.Request) {
+
+	// get username
+	vars := mux.Vars(r)
+	username := vars["username"]
+
+	// get user
+	user, err := userDB.GetUser(username)
+
+	// user doesn't exist
+	if err != nil {
+		log.Println(err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// generate PublicKeyCredentialRequestOptions, session data
+	options, sessionData, err := webAuthn.BeginLogin(user)
 	if err != nil {
 		log.Println(err)
 		jsonResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	session.Values["registration"] = sessionDataJSON
-	err = sessionStore.Save(r, w, session)
+	// store session data as marshaled JSON
+	err = sessionStore.SaveWebauthnSession("authentication", sessionData, r, w)
 	if err != nil {
 		log.Println(err)
 		jsonResponse(w, err.Error(), http.StatusInternalServerError)
@@ -87,6 +154,43 @@ func BeginRegistration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, options, http.StatusOK)
+}
+
+func FinishLogin(w http.ResponseWriter, r *http.Request) {
+
+	// get username
+	vars := mux.Vars(r)
+	username := vars["username"]
+
+	// get user
+	user, err := userDB.GetUser(username)
+
+	// user doesn't exist
+	if err != nil {
+		log.Println(err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// load the session data
+	sessionData, err := sessionStore.GetWebauthnSession("authentication", r)
+	if err != nil {
+		log.Println(err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// in an actual implementation we should perform additional
+	// checks on the returned 'credential'
+	_, err = webAuthn.FinishLogin(user, sessionData, r)
+	if err != nil {
+		log.Println(err)
+		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// handle successful login
+	jsonResponse(w, "Login Success", http.StatusOK)
 }
 
 func jsonResponse(w http.ResponseWriter, d interface{}, c int) {
